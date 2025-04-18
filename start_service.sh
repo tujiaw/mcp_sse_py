@@ -29,6 +29,23 @@ if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
+# 检查虚拟环境是否存在
+VENV_DIR=".venv"
+if [ ! -d "$VENV_DIR" ]; then
+    echo "错误: 虚拟环境目录 '$VENV_DIR' 不存在"
+    exit 1
+fi
+
+# 设置虚拟环境中Python解释器的路径
+if [ -f "$VENV_DIR/bin/python" ]; then
+    PYTHON_PATH="$VENV_DIR/bin/python"
+elif [ -f "$VENV_DIR/Scripts/python.exe" ]; then
+    PYTHON_PATH="$VENV_DIR/Scripts/python.exe"
+else
+    echo "错误: 无法找到虚拟环境中的Python解释器"
+    exit 1
+fi
+
 # 创建日志目录
 mkdir -p logs
 
@@ -36,11 +53,12 @@ mkdir -p logs
 LOG_FILE="logs/${SERVICE_NAME}_${PORT}.log"
 
 echo "正在启动服务: $SERVICE_NAME 在端口: $PORT"
+echo "使用虚拟环境: $PYTHON_PATH"
 echo "日志将保存在: $LOG_FILE"
 
 # 使用nohup启动服务
 cd $(dirname "$0")
-nohup python -m src.$SERVICE_NAME --port=$PORT > "$LOG_FILE" 2>&1 &
+nohup "$PYTHON_PATH" -m src.$SERVICE_NAME --port=$PORT > "$LOG_FILE" 2>&1 &
 
 # 获取进程ID
 PID=$!
