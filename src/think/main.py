@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Any, Union, Tuple
 import json
 import sys
 import time  # 导入time模块用于记录会话最后访问时间
+import asyncio  # 导入asyncio用于心跳功能
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
 from mcp.server.sse import SseServerTransport
@@ -302,25 +303,61 @@ def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlett
         # 输出会话ID信息，方便用户查看
         print(f"连接到会话 ID: {int_session_id}", file=sys.stderr)
         
+        # 创建一个心跳任务，保持连接活跃
+        async def send_heartbeat(writer):
+            """定期发送心跳消息给客户端以保持连接"""
+            try:
+                while True:
+                    await asyncio.sleep(15)  # 每15秒发送一次心跳
+                    print(f"发送心跳到客户端 (会话 ID: {int_session_id})", file=sys.stderr)
+                    await writer.write(": heartbeat\n\n")  # SSE注释行作为心跳
+            except asyncio.CancelledError:
+                # 任务被取消时正常退出
+                pass
+            except Exception as e:
+                print(f"心跳发送错误: {str(e)}", file=sys.stderr)
+        
         try:
             async with sse.connect_sse(
                     request.scope,
                     request.receive,
                     request._send,  # noqa: SLF001
             ) as (read_stream, write_stream):
-                await mcp_server.run(
-                    read_stream,
-                    write_stream,
-                    initialization_options,
-                )
+                # 启动心跳任务
+                heartbeat_task = asyncio.create_task(send_heartbeat(write_stream))
+                
+                try:
+                    # 运行主处理逻辑
+                    await mcp_server.run(
+                        read_stream,
+                        write_stream,
+                        initialization_options,
+                    )
+                finally:
+                    # 确保心跳任务被取消
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
         finally:
             # 连接关闭时不清理会话，而是依靠最大会话限制机制
+            print(f"客户端连接关闭 (会话 ID: {int_session_id})", file=sys.stderr)
             pass
+
+    # 修改响应头，防止某些代理服务器缓存或过早关闭连接
+    async def sse_endpoint(request: Request):
+        response = await handle_sse(request)
+        if response:
+            response.headers["Cache-Control"] = "no-cache, no-transform"
+            response.headers["Connection"] = "keep-alive"
+            response.headers["X-Accel-Buffering"] = "no"  # Nginx特定设置
+        return response
 
     return Starlette(
         debug=debug,
         routes=[
-            Route("/sse", endpoint=handle_sse),
+            Route("/sse", endpoint=sse_endpoint),
             Mount("/messages/", app=sse.handle_post_message),
         ],
     )
