@@ -58,7 +58,18 @@ echo "日志将保存在: $LOG_FILE"
 
 # 使用nohup启动服务
 cd $(dirname "$0")
-nohup "$PYTHON_PATH" -m src.$SERVICE_NAME --port=$PORT > "$LOG_FILE" 2>&1 &
+
+# 检查是否存在main.py文件
+if [ -f "src/$SERVICE_NAME/main.py" ]; then
+    echo "找到入口文件: src/$SERVICE_NAME/main.py"
+    nohup "$PYTHON_PATH" "src/$SERVICE_NAME/main.py" --port=$PORT > "$LOG_FILE" 2>&1 &
+elif [ -f "src/$SERVICE_NAME/__main__.py" ]; then
+    echo "找到入口文件: src/$SERVICE_NAME/__main__.py"
+    nohup "$PYTHON_PATH" -m "src.$SERVICE_NAME" --port=$PORT > "$LOG_FILE" 2>&1 &
+else
+    echo "警告: 未找到明确的入口文件，尝试执行作为脚本执行"
+    nohup "$PYTHON_PATH" -c "import sys; sys.path.insert(0, '.'); from src.$SERVICE_NAME import main; main.main(port=$PORT)" > "$LOG_FILE" 2>&1 &
+fi
 
 # 获取进程ID
 PID=$!
