@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Union, Tuple
 import json
 import sys
+import time  # 导入time模块用于记录会话最后访问时间
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
 from mcp.server.sse import SseServerTransport
@@ -124,8 +125,69 @@ class SequentialThinkingServer:
             raise ValueError(str(error))
 
 
-# 创建单例
-thinking_server = SequentialThinkingServer()
+# 会话管理器类，处理多个连接的状态
+class ThinkingSessionManager:
+    MAX_SESSIONS = 1000  # 最大会话数量限制
+    
+    def __init__(self):
+        self.sessions: Dict[int, SequentialThinkingServer] = {}  # 使用整数作为字典键
+        self.last_access: Dict[int, float] = {}  # 记录每个会话的最后访问时间
+        self.next_id = 1  # 自增ID计数器
+    
+    def _cleanup_oldest_session(self) -> None:
+        """清理最老的会话（最长时间未访问的）"""
+        if not self.sessions:
+            return
+            
+        # 按访问时间排序，找出最老的会话
+        oldest_session_id = min(self.last_access.items(), key=lambda x: x[1])[0]
+        self.remove_session(oldest_session_id)
+        print(f"会话数量达到上限，已清理最老会话 ID: {oldest_session_id}", file=sys.stderr)
+    
+    def get_or_create_session(self, session_id: Optional[str] = None) -> Tuple[int, SequentialThinkingServer]:
+        """获取现有会话或创建新会话，返回会话ID和服务器实例"""
+        current_time = time.time()
+        
+        # 尝试使用现有会话
+        if session_id:
+            try:
+                # 尝试将输入的session_id转换为整数
+                int_id = int(session_id)
+                if int_id in self.sessions:
+                    # 更新最后访问时间
+                    self.last_access[int_id] = current_time
+                    return int_id, self.sessions[int_id]
+            except (ValueError, TypeError):
+                # 如果转换失败，忽略输入的session_id
+                pass
+        
+        # 检查是否达到最大会话限制
+        if len(self.sessions) >= self.MAX_SESSIONS:
+            self._cleanup_oldest_session()
+        
+        # 生成新的自增ID
+        new_id = self.next_id
+        self.next_id += 1
+        self.sessions[new_id] = SequentialThinkingServer()
+        self.last_access[new_id] = current_time
+        return new_id, self.sessions[new_id]
+    
+    def remove_session(self, session_id: int) -> None:
+        """移除会话"""
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+            # 同时删除访问时间记录
+            if session_id in self.last_access:
+                del self.last_access[session_id]
+    
+    def update_access_time(self, session_id: int) -> None:
+        """更新会话的访问时间"""
+        if session_id in self.sessions:
+            self.last_access[session_id] = time.time()
+
+
+# 创建会话管理器实例
+thinking_manager = ThinkingSessionManager()
 
 
 @mcp.tool(
@@ -170,6 +232,7 @@ Parameters explained:
 - branch_from_thought: If branching, which thought number is the branching point
 - branch_id: Identifier for the current branch (if any)
 - needs_more_thoughts: If reaching end but realizing more thoughts needed
+- session_id: Identifier for the current session
 
 You should:
 1. Start with an initial estimate of needed thoughts, but be ready to adjust
@@ -189,6 +252,7 @@ async def sequentialthinking(
     thoughtNumber: int,
     totalThoughts: int,
     nextThoughtNeeded: bool,
+    sessionId: int,  # 会话ID参数，整数类型
     isRevision: Optional[bool] = None,
     revisesThought: Optional[int] = None,
     branchFromThought: Optional[int] = None,
@@ -198,6 +262,10 @@ async def sequentialthinking(
     """
     A detailed tool for dynamic and reflective problem-solving through thoughts.
     """
+    # 获取会话对应的服务器实例并更新访问时间
+    session_id, session_server = thinking_manager.get_or_create_session(str(sessionId))
+    thinking_manager.update_access_time(session_id)
+    
     input_data = {
         "thought": thought,
         "thoughtNumber": thoughtNumber,
@@ -210,7 +278,7 @@ async def sequentialthinking(
         "needsMoreThoughts": needsMoreThoughts
     }
     
-    return thinking_server.process_thought(input_data)
+    return session_server.process_thought(input_data)
 
 
 def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlette:
@@ -219,21 +287,35 @@ def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlett
 
     async def handle_sse(request: Request) -> None:
         """Handle SSE connection."""
+        # 从请求中获取会话ID，如果没有则创建新会话
+        session_id = request.query_params.get('session_id')
+        int_session_id, _ = thinking_manager.get_or_create_session(session_id)
+        
         # 创建初始化选项
         initialization_options = mcp_server.create_initialization_options()
         # 保存初始化选项到服务器实例
         mcp_server.initialization_options = initialization_options
         
-        async with sse.connect_sse(
-                request.scope,
-                request.receive,
-                request._send,  # noqa: SLF001
-        ) as (read_stream, write_stream):
-            await mcp_server.run(
-                read_stream,
-                write_stream,
-                initialization_options,
-            )
+        # 将会话ID放入初始化选项中，以便工具函数可以访问
+        initialization_options["sessionId"] = int_session_id
+        
+        # 输出会话ID信息，方便用户查看
+        print(f"连接到会话 ID: {int_session_id}", file=sys.stderr)
+        
+        try:
+            async with sse.connect_sse(
+                    request.scope,
+                    request.receive,
+                    request._send,  # noqa: SLF001
+            ) as (read_stream, write_stream):
+                await mcp_server.run(
+                    read_stream,
+                    write_stream,
+                    initialization_options,
+                )
+        finally:
+            # 连接关闭时不清理会话，而是依靠最大会话限制机制
+            pass
 
     return Starlette(
         debug=debug,
