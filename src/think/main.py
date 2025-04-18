@@ -7,6 +7,7 @@ import time  # 导入time模块用于记录会话最后访问时间
 import asyncio  # 导入asyncio用于心跳功能
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
+from starlette.sse import EventSourceResponse
 from mcp.server.sse import SseServerTransport
 from starlette.requests import Request
 from starlette.routing import Mount, Route
@@ -312,18 +313,52 @@ def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlett
         print(f"连接到会话 ID: {int_session_id}", file=sys.stderr)
         
         # 创建一个心跳任务，保持连接活跃
-        async def send_heartbeat(writer):
+        async def send_heartbeat(write_stream):
             """定期发送心跳消息给客户端以保持连接"""
             try:
                 while True:
                     await asyncio.sleep(15)  # 每15秒发送一次心跳
                     print(f"发送心跳到客户端 (会话 ID: {int_session_id})", file=sys.stderr)
-                    await writer.write(": heartbeat\n\n")  # SSE注释行作为心跳
+                    
+                    try:
+                        # MCP协议心跳消息 - JSON-RPC 2.0格式
+                        heartbeat_message = {
+                            "jsonrpc": "2.0",
+                            "method": "$/ping",
+                            "id": f"heartbeat-{int(time.time())}"
+                        }
+                        
+                        # 将心跳消息转换为SSE事件格式
+                        sse_event = {
+                            "event": "message",
+                            "data": json.dumps(heartbeat_message)
+                        }
+                        
+                        # 检查write_stream支持的方法并使用合适的发送方式
+                        if hasattr(write_stream, 'send'):
+                            await write_stream.send(sse_event)
+                        elif hasattr(write_stream, 'send_json'):
+                            await write_stream.send_json(sse_event)
+                        elif hasattr(write_stream, 'put'):
+                            await write_stream.put(sse_event)
+                        else:
+                            # 如果上述方法都不可用，尝试直接作为SSE格式字符串发送
+                            event_str = f"event: message\ndata: {json.dumps(heartbeat_message)}\n\n"
+                            if hasattr(write_stream, 'send_text'):
+                                await write_stream.send_text(event_str)
+                            else:
+                                print(f"无法找到合适的方法发送心跳", file=sys.stderr)
+                        
+                    except Exception as e:
+                        print(f"心跳发送错误: {str(e)}", file=sys.stderr)
+                    
             except asyncio.CancelledError:
                 # 任务被取消时正常退出
                 pass
             except Exception as e:
-                print(f"心跳发送错误: {str(e)}", file=sys.stderr)
+                print(f"心跳任务错误: {str(e)}", file=sys.stderr)
+                print(f"心跳Writer类型: {type(write_stream)}", file=sys.stderr)
+                print(f"心跳Writer可用方法: {dir(write_stream)}", file=sys.stderr)
         
         try:
             async with sse.connect_sse(
@@ -331,6 +366,10 @@ def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlett
                     request.receive,
                     request._send,  # noqa: SLF001
             ) as (read_stream, write_stream):
+                # 添加调试信息，了解write_stream的类型和方法
+                print(f"SSE连接建立，write_stream类型: {type(write_stream)}", file=sys.stderr)
+                print(f"write_stream可用方法: {dir(write_stream)}", file=sys.stderr)
+                
                 # 启动心跳任务
                 heartbeat_task = asyncio.create_task(send_heartbeat(write_stream))
                 
@@ -353,18 +392,38 @@ def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlett
             print(f"客户端连接关闭 (会话 ID: {int_session_id})", file=sys.stderr)
             pass
 
-    # 修改响应头，防止某些代理服务器缓存或过早关闭连接
+    # 创建带有自定义响应头的SSE端点
     async def sse_endpoint(request: Request):
+        response = EventSourceResponse(
+            generate_events(request),
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"  # Nginx特定设置
+            }
+        )
+        return response
+    
+    # 定义生成SSE事件的异步生成器
+    async def generate_events(request: Request):
+        # 这个函数实际不会执行到，因为我们使用自定义的connect_sse
+        # 但是需要它来创建EventSourceResponse
         await handle_sse(request)
-        # handle_sse不返回响应对象，所以这里不需要尝试设置头信息
-        return None
+        yield {}  # 不会执行到这里
 
+    # 使用定制的路由
+    routes = [
+        Route("/sse", endpoint=handle_sse),
+        Mount("/messages/", app=sse.handle_post_message),
+    ]
+    
+    # 使用定制的中间件设置响应头
+    middleware = []
+    
     return Starlette(
         debug=debug,
-        routes=[
-            Route("/sse", endpoint=sse_endpoint),
-            Mount("/messages/", app=sse.handle_post_message),
-        ],
+        routes=routes,
+        middleware=middleware
     )
 
 
