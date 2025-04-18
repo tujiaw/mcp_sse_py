@@ -297,8 +297,16 @@ def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlett
         # 保存初始化选项到服务器实例
         mcp_server.initialization_options = initialization_options
         
-        # 将会话ID放入初始化选项中，以便工具函数可以访问
-        initialization_options["sessionId"] = int_session_id
+        # 将会话ID放入初始化选项的默认参数中（不能直接赋值给InitializationOptions对象）
+        # InitializationOptions 不支持直接赋值，使用其内部结构或方法
+        if hasattr(initialization_options, 'default_parameters'):
+            initialization_options.default_parameters['sessionId'] = int_session_id
+        elif hasattr(initialization_options, 'set_parameter'):
+            initialization_options.set_parameter('sessionId', int_session_id)
+        elif hasattr(initialization_options, 'parameters'):
+            initialization_options.parameters['sessionId'] = int_session_id
+        else:
+            print(f"警告: 无法设置会话ID到初始化选项中，连接可能无法使用正确的会话", file=sys.stderr)
         
         # 输出会话ID信息，方便用户查看
         print(f"连接到会话 ID: {int_session_id}", file=sys.stderr)
@@ -347,12 +355,9 @@ def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlett
 
     # 修改响应头，防止某些代理服务器缓存或过早关闭连接
     async def sse_endpoint(request: Request):
-        response = await handle_sse(request)
-        if response:
-            response.headers["Cache-Control"] = "no-cache, no-transform"
-            response.headers["Connection"] = "keep-alive"
-            response.headers["X-Accel-Buffering"] = "no"  # Nginx特定设置
-        return response
+        await handle_sse(request)
+        # handle_sse不返回响应对象，所以这里不需要尝试设置头信息
+        return None
 
     return Starlette(
         debug=debug,
